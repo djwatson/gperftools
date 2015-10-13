@@ -64,23 +64,25 @@ inline void *SLL_Pop(void **list) {
 // modified to point to the new head.  start and end will point to the first
 // and last nodes of the range.  Note that end will point to NULL after this
 // function is called.
-inline void SLL_PopRange(void **head, int N, void **start, void **end) {
-  if (N == 0) {
+inline int SLL_PopRange(void **head, int N, void **start, void **end) {
+  if (N == 0 || *head == nullptr) {
     *start = NULL;
     *end = NULL;
-    return;
+    return 0;
   }
 
   void *tmp = *head;
-  for (int i = 1; i < N; ++i) {
+  int i = 1;
+  for (i = 1; i < N; ++i) {
+    if (!SLL_Next(tmp)) break;
     tmp = SLL_Next(tmp);
   }
-
   *start = *head;
   *end = tmp;
   *head = SLL_Next(tmp);
   // Unlink range from list.
   SLL_SetNext(tmp, NULL);
+  return i;
 }
 
 inline void SLL_PushRange(void **head, void *start, void *end) {

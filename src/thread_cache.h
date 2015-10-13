@@ -56,6 +56,101 @@
 #include "page_heap_allocator.h"  // for PageHeapAllocator
 #include "sampler.h"           // for Sampler
 #include "static_vars.h"       // for Static
+#include <thread>
+#include <condition_variable>
+
+extern "C" {
+#include "rseq/rseq.h"
+}
+
+
+struct rseq_section {
+	void *begin;
+	void *end;
+	void *restart;
+};
+
+extern struct rseq_section const __start___rseq_sections[]
+__attribute((weak));
+extern struct rseq_section const __stop___rseq_sections[]
+__attribute((weak));
+
+inline int rseq_percpu_cmpxchg(int cpu, intptr_t *p, intptr_t old, intptr_t newv) {
+	asm volatile goto (
+		"1:\n\t"
+		"cmpl %1, %0\n\t"
+		"jne %l[fail]\n\t"
+		"cmpq %2, %3\n\t"
+		"jne %l[fail]\n\t"
+		"movq %4, %3\n\t"
+		"2:\n\t"
+		".pushsection __rseq_sections, \"a\"\n\t"
+		".quad 1b, 2b, 1b\n\t"
+		".popsection\n\t"
+		:
+		: "r" (cpu), "m" (__rseq_current_cpu),
+		  "r" (old), "m" (*p), "r" (newv)
+		: "memory"
+		: fail);
+	return 0;
+fail:
+	return -1;
+}
+inline int rseq_percpu_cmpxchgcheck(int cpu, intptr_t *p, intptr_t old, intptr_t newv,
+			intptr_t *check_ptr, intptr_t check_val) {
+	asm volatile goto (
+		"1:\n\t"
+		"cmpl %1, %0\n\t"
+		"jne %l[fail]\n\t"
+		"cmpq %2, %3\n\t"
+		"jne %l[fail]\n\t"
+		"cmpq %5, %6\n\t"
+		"jne %l[fail]\n\t"
+		"movq %4, %3\n\t"
+		"2:\n\t"
+		".pushsection __rseq_sections, \"a\"\n\t"
+		".quad 1b, 2b, 1b\n\t"
+		".popsection\n\t"
+		:
+		: "r" (cpu), "m" (__rseq_current_cpu),
+		  "r" (old), "m" (*p), "r" (newv),
+		  "r" (check_val), "m" (*check_ptr)
+		: "memory"
+		: fail);
+	return 0;
+fail:
+	return -1;
+}
+
+inline int rseq_percpu_cmpxchgcheckcheck(int cpu, intptr_t *p, intptr_t old, intptr_t newv,
+                                  intptr_t *check_ptr, intptr_t check_val,
+                                  intptr_t *check_ptr2, intptr_t check_val2) {
+	asm volatile goto (
+		"1:\n\t"
+		"cmpl %1, %0\n\t"
+		"jne %l[fail]\n\t"
+		"cmpq %2, %3\n\t"
+		"jne %l[fail]\n\t"
+		"cmpq %5, %6\n\t"
+		"jne %l[fail]\n\t"
+		"cmpq %7, %8\n\t"
+		"jne %l[fail]\n\t"
+		"movq %4, %3\n\t"
+		"2:\n\t"
+		".pushsection __rseq_sections, \"a\"\n\t"
+		".quad 1b, 2b, 1b\n\t"
+		".popsection\n\t"
+		:
+		: "r" (cpu), "m" (__rseq_current_cpu),
+		  "r" (old), "m" (*p), "r" (newv),
+		  "r" (check_val), "m" (*check_ptr),
+		  "r" (check_val2), "m" (*check_ptr2)
+		: "memory"
+		: fail);
+	return 0;
+fail:
+	return -1;
+}
 
 namespace tcmalloc {
 
@@ -86,8 +181,10 @@ class ThreadCache {
 
   // Allocate an object of the given size and class. The size given
   // must be the same as the size of the class in the size map.
-  void* Allocate(size_t size, size_t cl);
-  void Deallocate(void* ptr, size_t size_class);
+  void* AllocateThread(size_t size, size_t cl);
+  void DeallocateThread(void* ptr, size_t size_class);
+  static void* Allocate(ThreadCache* heap, size_t size, size_t cl);
+  static void Deallocate(ThreadCache* heap, void* ptr, size_t size_class);
 
   void Scavenge();
 
@@ -135,7 +232,15 @@ class ThreadCache {
 
 #ifdef _LP64
     // On 64-bit hardware, manipulating 16-bit values may be slightly slow.
-    uint32_t length_;      // Current length.
+   public:
+    uint64_t getLength() const {
+      return (unsigned long)list_ >> 48;
+    }
+   private:
+    void* getList() const {
+      return (void*)((unsigned long)list_ & 0x0000FFFFFFFFFFFF);
+    }
+
     uint32_t lowater_;     // Low water mark for list length.
     uint32_t max_length_;  // Dynamic max list length based on usage.
     // Tracks the number of times a deallocation has caused
@@ -153,7 +258,6 @@ class ThreadCache {
    public:
     void Init() {
       list_ = NULL;
-      length_ = 0;
       lowater_ = 0;
       max_length_ = 1;
       length_overages_ = 0;
@@ -161,7 +265,7 @@ class ThreadCache {
 
     // Return current length of list
     size_t length() const {
-      return length_;
+      return getLength();
     }
 
     // Return the maximum length of the list.
@@ -191,34 +295,77 @@ class ThreadCache {
 
     // Low-water mark management
     int lowwatermark() const { return lowater_; }
-    void clear_lowwatermark() { lowater_ = length_; }
+    void clear_lowwatermark() { lowater_ = getLength(); }
 
     void Push(void* ptr) {
-      SLL_Push(&list_, ptr);
-      length_++;
+      void* list = getList();
+      SLL_Push(&list, ptr);
+      list_ = (void*)(((getLength() + 1) << 48) | (unsigned long)list);
+    }
+
+    bool PushCheck(void* node, int cpu, intptr_t* l) {
+      void* old = list_;
+      SLL_SetNext(node, (void*)((unsigned long)old & 0x0000FFFFFFFFFFFF));
+      node =  (void*)((unsigned long)node | ((getLength() + 1) << 48));
+      if (0 == rseq_percpu_cmpxchgcheck(
+            cpu,
+            (intptr_t *)&list_, (intptr_t)old, (intptr_t)node,
+            (intptr_t*)l, 0)){
+        ASSERT((int)getLength() >= 0);
+        return true;
+      }
+      return false;
     }
 
     void* Pop() {
       ASSERT(list_ != NULL);
-      length_--;
-      if (length_ < lowater_) lowater_ = length_;
-      return SLL_Pop(&list_);
+      void* list = getList();
+      if (getLength() < lowater_) lowater_ = getLength();
+      auto ret = SLL_Pop(&list);
+      list_ = (void*)(((getLength() - 1) << 48) | (unsigned long)list);
+      return ret;
+    }
+
+    void* PopCheck(int cpu, intptr_t l) {
+      //ASSERT(list_ != NULL);
+      void* old = list_;
+      void* head = (void*)((unsigned long)old & 0x0000FFFFFFFFFFFF);
+      if (head == nullptr) {
+        return nullptr;
+      }
+      void* next = SLL_Next(head);
+      void* tnext = (void*)((unsigned long)next | ((getLength() - 1) << 48));
+      if (0 == rseq_percpu_cmpxchgcheckcheck(
+            cpu,
+            (intptr_t*)&list_, (intptr_t)old, (intptr_t)tnext,
+            (intptr_t *)(reinterpret_cast<void**>(head)), (intptr_t)next,
+            (intptr_t*)l, (intptr_t)0)) {
+        ASSERT((int)getLength() >= 0);
+        if (getLength() < lowater_) lowater_ = getLength();
+        return head;
+      }
+
+      return nullptr;
     }
 
     void* Next() {
-      return SLL_Next(&list_);
+      void* list = getList();
+      return SLL_Next(&list);
     }
 
     void PushRange(int N, void *start, void *end) {
-      SLL_PushRange(&list_, start, end);
-      length_ += N;
+      void * list = getList();
+      SLL_PushRange(&list, start, end);
+      list_ = (void*)((unsigned long)list | ((getLength() + N) << 48));
     }
 
-    void PopRange(int N, void **start, void **end) {
-      SLL_PopRange(&list_, N, start, end);
-      ASSERT(length_ >= N);
-      length_ -= N;
-      if (length_ < lowater_) lowater_ = length_;
+    int PopRange(int N, void **start, void **end) {
+      void * list = getList();
+      int ret = SLL_PopRange(&list, N, start, end);
+      ASSERT(getLength() >= ret);
+      list_ = (void*)((unsigned long)list | ((getLength() - ret) << 48));
+      if (getLength() < lowater_) lowater_ = getLength();
+      return ret;
     }
   };
 
@@ -282,6 +429,9 @@ class ThreadCache {
 
   // Linked list of heap objects.  Protected by Static::pageheap_lock.
   static ThreadCache* thread_heaps_;
+  static ThreadCache* cpu_heaps_[32];
+  static std::atomic<int> thread_count_;
+  static bool go_percpu_;
   static int thread_heap_count_;
 
   // A pointer to one of the objects in thread_heaps_.  Represents
@@ -306,7 +456,11 @@ class ThreadCache {
   // This class is laid out with the most frequently used fields
   // first so that hot elements are placed on the same cache line.
 
+  long lock_;
+  std::mutex m_;
+  std::condition_variable cv_;
   size_t        size_;                  // Combined size of data
+  size_t        scavenge_count_;
   size_t        max_size_;              // size_ > max_size_ --> Scavenge()
 
   // We sample allocations, biased by the size of the allocation
@@ -345,7 +499,7 @@ inline bool ThreadCache::SampleAllocation(size_t k) {
   return sampler_.SampleAllocation(k);
 }
 
-inline void* ThreadCache::Allocate(size_t size, size_t cl) {
+inline void* ThreadCache::AllocateThread(size_t size, size_t cl) {
   ASSERT(size <= kMaxSize);
   ASSERT(size == Static::sizemap()->ByteSizeForClass(cl));
 
@@ -357,7 +511,61 @@ inline void* ThreadCache::Allocate(size_t size, size_t cl) {
   return list->Pop();
 }
 
-inline void ThreadCache::Deallocate(void* ptr, size_t cl) {
+inline void* ThreadCache::Allocate(ThreadCache* heap, size_t size, size_t cl) {
+  if (!go_percpu_) {
+    return heap->AllocateThread(size, cl);
+  }
+
+  ASSERT(size <= kMaxSize);
+  ASSERT(size == Static::sizemap()->ByteSizeForClass(cl));
+  void* ret = nullptr;
+  int cpu;
+  FreeList* list;
+
+  retry:
+    do {
+      cpu = rseq_current_cpu();
+      heap = cpu_heaps_[cpu];
+      list = &heap->list_[cl];
+
+      if (heap->lock_) {
+        std::unique_lock<std::mutex> lk(heap->m_);
+        heap->cv_.wait(lk, [&]{return !heap->lock_;});
+        continue;
+      }
+
+      if (list->empty()) {
+        break;
+      }
+      ret = list->PopCheck(cpu, (intptr_t)&heap->lock_);
+    } while (!ret);
+
+    if (!ret) {
+
+      bool expected = false;
+      if (0 == rseq_percpu_cmpxchg(cpu, (intptr_t*)&heap->lock_, (intptr_t)0, (intptr_t)1)) {
+
+
+        ret = heap->FetchFromCentralCache(cl, size);
+
+        std::unique_lock<std::mutex> lk(heap->m_);
+        heap->lock_ = false;
+        heap->cv_.notify_all();
+        return ret;
+      } else {
+        goto retry;
+      }
+    }
+
+    if (ret) {
+      heap->size_ -= Static::sizemap()->ByteSizeForClass(cl);
+    }
+
+
+    return ret;
+}
+
+inline void ThreadCache::DeallocateThread(void* ptr, size_t cl) {
   FreeList* list = &list_[cl];
   size_ += Static::sizemap()->ByteSizeForClass(cl);
   ssize_t size_headroom = max_size_ - size_ - 1;
@@ -382,7 +590,69 @@ inline void ThreadCache::Deallocate(void* ptr, size_t cl) {
   }
 }
 
+inline void ThreadCache::Deallocate(ThreadCache* heap, void* ptr, size_t cl) {
+  if (!go_percpu_) {
+    return heap->DeallocateThread(ptr, cl);
+  }
+
+  int cpu;
+  FreeList* list;
+
+  do {
+    cpu = rseq_current_cpu();
+    heap = cpu_heaps_[cpu];
+    list = &heap->list_[cl];
+
+    if (heap->lock_) {
+      std::unique_lock<std::mutex> lk(heap->m_);
+      heap->cv_.wait(lk, [&]{return !heap->lock_;});
+      continue;
+    }
+
+    // This catches back-to-back frees of allocs in the same size
+    // class. A more comprehensive (and expensive) test would be to walk
+    // the entire freelist. But this might be enough to find some bugs.
+    ASSERT(ptr != list->Next());
+    if (list->PushCheck(ptr, cpu, (intptr_t*)&heap->lock_)) {
+      break;
+    }
+  } while (true);
+  heap->size_ += Static::sizemap()->ByteSizeForClass(cl);
+
+  if (list->length() > list->max_length() ||
+      ++heap->scavenge_count_ >= 100000) {
+    if (0 != rseq_percpu_cmpxchg(
+          cpu,
+          (intptr_t*)&heap->lock_, (intptr_t)0, (intptr_t)1)) {
+      printf("lock miss\n");
+      return;
+    }
+
+    if (list->length() > list->max_length()) {
+      heap->ListTooLong(list, cl);
+    } else {
+      long sz = 0;
+      for (int cl = 0; cl < kNumClasses; cl++) {
+        size_t bytes = Static::sizemap()->ByteSizeForClass(cl);
+        sz += heap->list_[cl].getLength() * bytes;
+      }
+      if (sz > heap->max_size_ * 16 * (thread_count_/32 + 1)) {
+        heap->Scavenge();
+      }
+    }
+    heap->scavenge_count_ = 0;
+    std::unique_lock<std::mutex> lk(heap->m_);
+    heap->lock_ = false;
+    heap->cv_.notify_all();
+  }
+}
+
 inline ThreadCache* ThreadCache::GetThreadHeap() {
+
+  if (go_percpu_) {
+    return cpu_heaps_[rseq_current_cpu()];
+  }
+
 #ifdef HAVE_TLS
   return threadlocal_data_.heap;
 #else
@@ -392,6 +662,11 @@ inline ThreadCache* ThreadCache::GetThreadHeap() {
 }
 
 inline ThreadCache* ThreadCache::GetCacheWhichMustBePresent() {
+
+  if (go_percpu_) {
+    return cpu_heaps_[rseq_current_cpu()];
+  }
+
 #ifdef HAVE_TLS
   ASSERT(threadlocal_data_.heap);
   return threadlocal_data_.heap;
@@ -401,6 +676,7 @@ inline ThreadCache* ThreadCache::GetCacheWhichMustBePresent() {
       perftools_pthread_getspecific(heap_key_));
 #endif
 }
+
 
 inline ThreadCache* ThreadCache::GetCache() {
   ThreadCache* ptr = NULL;

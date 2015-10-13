@@ -109,7 +109,7 @@ static const size_t kMaxPages = 1 << (20 - kPageShift);
 // for the small memory footprint case.
 static const size_t kDefaultOverallThreadCacheSize = kMaxThreadCacheSize;
 #else
-static const size_t kDefaultOverallThreadCacheSize = 8u * kMaxThreadCacheSize;
+static const size_t kDefaultOverallThreadCacheSize = 16u * kMaxThreadCacheSize;
 #endif
 
 // Lower bound on the per-thread cache sizes

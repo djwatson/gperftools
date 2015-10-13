@@ -108,7 +108,7 @@ class CentralFreeList {
   // Starting point for the the maximum number of entries in the transfer cache.
   // This actual maximum for a given size class may be lower than this
   // maximum value.
-  static const int kMaxNumTransferEntries = 64;
+  static const int kMaxNumTransferEntries = 2048;
 #endif
 
   // REQUIRES: lock_ is held

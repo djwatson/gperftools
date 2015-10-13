@@ -1176,7 +1176,7 @@ ALWAYS_INLINE void* do_malloc_small(ThreadCache* heap, size_t size) {
   } else {
     // The common case, and also the simplest.  This just pops the
     // size-appropriate freelist, after replenishing it if it's empty.
-    return CheckedMallocResult(heap->Allocate(size, cl));
+    return CheckedMallocResult(ThreadCache::Allocate(heap, size, cl));
   }
 }
 
@@ -1273,7 +1273,7 @@ ALWAYS_INLINE void do_free_helper(void* ptr,
   if (LIKELY(cl != 0)) {
     ASSERT(!Static::pageheap()->GetDescriptor(p)->sample);
     if (heap_must_be_valid || heap != NULL) {
-      heap->Deallocate(ptr, cl);
+      ThreadCache::Deallocate(heap, ptr, cl);
     } else {
       // Delete directly into central cache
       tcmalloc::SLL_SetNext(ptr, NULL);
@@ -1430,7 +1430,7 @@ void* do_memalign(size_t align, size_t size) {
     if (cl < kNumClasses) {
       ThreadCache* heap = ThreadCache::GetCache();
       size = Static::sizemap()->class_to_size(cl);
-      return CheckedMallocResult(heap->Allocate(size, cl));
+      return CheckedMallocResult(ThreadCache::Allocate(heap, size, cl));
     }
   }
 

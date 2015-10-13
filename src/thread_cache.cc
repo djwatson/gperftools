@@ -66,6 +66,9 @@ size_t ThreadCache::overall_thread_cache_size_ = kDefaultOverallThreadCacheSize;
 ssize_t ThreadCache::unclaimed_cache_space_ = kDefaultOverallThreadCacheSize;
 PageHeapAllocator<ThreadCache> threadcache_allocator;
 ThreadCache* ThreadCache::thread_heaps_ = NULL;
+ThreadCache* ThreadCache::cpu_heaps_[32]{0};
+std::atomic<int> ThreadCache::thread_count_;
+bool ThreadCache::go_percpu_{false};
 int ThreadCache::thread_heap_count_ = 0;
 ThreadCache* ThreadCache::next_memory_steal_ = NULL;
 #ifdef HAVE_TLS
@@ -78,6 +81,7 @@ pthread_key_t ThreadCache::heap_key_;
 
 void ThreadCache::Init(pthread_t tid) {
   size_ = 0;
+  lock_ = false;
 
   max_size_ = 0;
   IncreaseCacheLimitLocked();
@@ -117,7 +121,6 @@ void ThreadCache::Cleanup() {
 // On success, return the first object for immediate use; otherwise return NULL.
 void* ThreadCache::FetchFromCentralCache(size_t cl, size_t byte_size) {
   FreeList* list = &list_[cl];
-  ASSERT(list->empty());
   const int batch_size = Static::sizemap()->num_objects_to_move(cl);
 
   const int num_to_move = min<int>(list->max_length(), batch_size);
@@ -134,13 +137,13 @@ void* ThreadCache::FetchFromCentralCache(size_t cl, size_t byte_size) {
   // Increase max length slowly up to batch_size.  After that,
   // increase by batch_size in one shot so that the length is a
   // multiple of batch_size.
-  if (list->max_length() < batch_size) {
+  if (list->max_length() < batch_size * 6) {
     list->set_max_length(list->max_length() + 1);
   } else {
     // Don't let the list get too long.  In 32 bit builds, the length
     // is represented by a 16 bit int, so we need to watch out for
     // integer overflow.
-    int new_length = min<int>(list->max_length() + batch_size,
+    int new_length = min<int>(list->max_length() + batch_size * 6,
                               kMaxDynamicFreeListLength);
     // The list's max_length must always be a multiple of batch_size,
     // and kMaxDynamicFreeListLength is not necessarily a multiple
@@ -161,15 +164,15 @@ void ThreadCache::ListTooLong(FreeList* list, size_t cl) {
   // num_objects_to_move, so the code below tries to make max_length
   // converge on num_objects_to_move.
 
-  if (list->max_length() < batch_size) {
+  if (list->max_length() < batch_size * 6) {
     // Slow start the max_length so we don't overreserve.
     list->set_max_length(list->max_length() + 1);
-  } else if (list->max_length() > batch_size) {
+  } else if (list->max_length() > batch_size * 6) {
     // If we consistently go over max_length, shrink max_length.  If we don't
     // shrink it, some amount of memory will always stay in this freelist.
     list->set_length_overages(list->length_overages() + 1);
     if (list->length_overages() > kMaxOverages) {
-      ASSERT(list->max_length() > batch_size);
+      ASSERT(list->max_length() > batch_size * 6);
       list->set_max_length(list->max_length() - batch_size);
       list->set_length_overages(0);
     }
@@ -180,21 +183,35 @@ void ThreadCache::ListTooLong(FreeList* list, size_t cl) {
 void ThreadCache::ReleaseToCentralCache(FreeList* src, size_t cl, int N) {
   ASSERT(src == &list_[cl]);
   if (N > src->length()) N = src->length();
-  size_t delta_bytes = N * Static::sizemap()->ByteSizeForClass(cl);
 
   // We return prepackaged chains of the correct size to the central cache.
   // TODO: Use the same format internally in the thread caches?
   int batch_size = Static::sizemap()->num_objects_to_move(cl);
-  while (N > batch_size) {
+  int tot_popped = 0;
+  while (N >= batch_size) {
     void *tail, *head;
-    src->PopRange(batch_size, &head, &tail);
-    Static::central_cache()[cl].InsertRange(head, tail, batch_size);
-    N -= batch_size;
+    int popped = src->PopRange(batch_size, &head, &tail);
+    if (popped) {
+      tot_popped += popped;
+      size_t delta_bytes = popped * Static::sizemap()->ByteSizeForClass(cl);
+      size_ -= delta_bytes;
+      Static::central_cache()[cl].InsertRange(head, tail, popped);
+      N -= popped;
+      if (popped < batch_size) {
+        return;
+      }
+    } else {
+      return;
+    }
   }
   void *tail, *head;
-  src->PopRange(N, &head, &tail);
-  Static::central_cache()[cl].InsertRange(head, tail, N);
-  size_ -= delta_bytes;
+  int popped = src->PopRange(N, &head, &tail);
+  if (popped) {
+    tot_popped += popped;
+    Static::central_cache()[cl].InsertRange(head, tail, popped);
+    size_t delta_bytes = popped * Static::sizemap()->ByteSizeForClass(cl);
+    size_ -= delta_bytes;
+  }
 }
 
 // Release idle memory to the central cache
@@ -220,7 +237,7 @@ void ThreadCache::Scavenge() {
       // mainly for threads that stay relatively idle for their entire
       // lifetime.
       const int batch_size = Static::sizemap()->num_objects_to_move(cl);
-      if (list->max_length() > batch_size) {
+      if (list->max_length() > batch_size * 6) {
         list->set_max_length(
             max<int>(list->max_length() - batch_size, batch_size));
       }
@@ -271,16 +288,38 @@ int ThreadCache::GetSamplePeriod() {
 }
 
 void ThreadCache::InitModule() {
+  int i = 0;
   SpinLockHolder h(Static::pageheap_lock());
   if (!phinited) {
+	const struct rseq_section *iter;
+	for (iter = __start___rseq_sections;
+	     iter < __stop___rseq_sections;
+	     iter++) {
+		rseq_configure_region(iter->begin, iter->end, iter->restart);
+
+                i++;
+	}
+        /*
+    rseq_configure_region(&RSEQ_CRITICAL_SECTION_START,
+                          &RSEQ_CRITICAL_SECTION_END,
+                          &RSEQ_RESTART_HANDLER);
+        */
+    rseq_configure_cpu_pointer();
     const char *tcb = TCMallocGetenvSafe("TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES");
     if (tcb) {
       set_overall_thread_cache_size(strtoll(tcb, NULL, 10));
     }
     Static::InitStaticVars();
     threadcache_allocator.Init();
+
+    for (int i = 0; i < 32; i++) {
+      cpu_heaps_[i] = NewHeap(-1);
+    }
+    thread_count_ = 0;
+
     phinited = 1;
   }
+  printf("Installed %i sections\n", i);
 }
 
 void ThreadCache::InitTSD() {
@@ -348,6 +387,14 @@ ThreadCache* ThreadCache::CreateCacheIfNecessary() {
     // Also keep a copy in __thread for faster retrieval
     threadlocal_data_.heap = heap;
     SetMinSizeForSlowPath(kMaxSize + 1);
+    rseq_configure_cpu_pointer();
+    thread_count_++;
+    if (thread_count_ > 40) {
+      if (!go_percpu_) {
+        printf("Going percpu!\n");
+      }
+      go_percpu_ = true;
+    }
 #endif
     heap->in_setspecific_ = false;
   }
@@ -374,7 +421,14 @@ ThreadCache* ThreadCache::NewHeap(pthread_t tid) {
 
 void ThreadCache::BecomeIdle() {
   if (!tsd_inited_) return;              // No caches yet
-  ThreadCache* heap = GetThreadHeap();
+  ThreadCache* heap;
+#ifdef HAVE_TLS
+  heap = threadlocal_data_.heap;
+#else
+  heap = reinterpret_cast<ThreadCache *>(
+      perftools_pthread_getspecific(heap_key_));
+#endif
+
   if (heap == NULL) return;             // No thread cache to remove
   if (heap->in_setspecific_) return;    // Do not disturb the active caller
 
@@ -401,6 +455,14 @@ void ThreadCache::DestroyThreadCache(void* ptr) {
   // to invoke the destructor on NULL values, but for safety,
   // we check anyway.
   if (ptr == NULL) return;
+  thread_count_ --;
+  if (thread_count_ < 4) {
+    if (go_percpu_) {
+      printf("Going per thread :(\n");
+    }
+    go_percpu_ = false;
+  }
+
 #ifdef HAVE_TLS
   // Prevent fast path of GetThreadHeap() from returning heap.
   threadlocal_data_.heap = NULL;

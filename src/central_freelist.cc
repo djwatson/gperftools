@@ -72,7 +72,7 @@ void CentralFreeList::Init(size_t cl) {
     // 1MB * kMaxNumTransferEntries.
     // min and max are in parens to avoid macro-expansion on windows.
     max_cache_size_ = (min)(max_cache_size_,
-                          (max)(1, (1024 * 1024) / (bytes * objs_to_move)));
+                          (max)(1, (1024 * 1024 * 32) / (bytes * objs_to_move)));
     cache_size_ = (min)(cache_size_, max_cache_size_);
   }
   used_slots_ = 0;
